@@ -218,7 +218,7 @@ public class Http2SolrClient extends SolrClient {
     httpClientExecutor = new SolrQueuedThreadPool("http2Client",
         Integer.getInteger("solr.maxHttp2ClientThreads", Math.max(12, ParWork.PROC_COUNT / 2)),
         Integer.getInteger("solr.minHttp2ClientThreads", 4),
-        this.headers.get(QoSParams.REQUEST_SOURCE).equals(QoSParams.INTERNAL) ? 500 : 5000, null, null);
+        this.headers != null && this.headers.get(QoSParams.REQUEST_SOURCE).equals(QoSParams.INTERNAL) ? 500 : 5000, null, null);
     httpClientExecutor.setLowThreadsThreshold(-1);
 
     boolean sslOnJava8OrLower = ssl && !Constants.JRE_IS_MINIMUM_JAVA9;
