@@ -73,6 +73,7 @@ import org.apache.solr.common.util.ContentStream;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.ObjectReleaseTracker;
 import org.apache.solr.common.util.SolrInternalHttpClient;
+import org.apache.solr.common.util.SolrNamedThreadFactory;
 import org.apache.solr.common.util.SolrQueuedThreadPool;
 import org.apache.solr.common.util.SolrScheduledExecutorScheduler;
 import org.apache.solr.common.util.Utils;
@@ -97,6 +98,7 @@ import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpMethod;
 import org.eclipse.jetty.http2.client.HTTP2Client;
 import org.eclipse.jetty.http2.client.http.HttpClientTransportOverHTTP2;
+import org.eclipse.jetty.util.BlockingArrayQueue;
 import org.eclipse.jetty.util.Fields;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.slf4j.Logger;
@@ -140,6 +142,7 @@ public class Http2SolrClient extends SolrClient {
   private volatile HttpClient httpClient;
   private volatile Set<String> queryParams = Collections.emptySet();
   private int idleTimeout;
+  private boolean strictEventOrdering;
   private volatile ResponseParser parser = new BinaryResponseParser();
   private volatile RequestWriter requestWriter = new BinaryRequestWriter();
   private final Set<HttpListenerFactory> listenerFactory = ConcurrentHashMap.newKeySet();
@@ -166,6 +169,7 @@ public class Http2SolrClient extends SolrClient {
     }
 
     this.headers = builder.headers;
+    this.strictEventOrdering = builder.strictEventOrdering;
 
     if (builder.idleTimeout != null && builder.idleTimeout > 0) idleTimeout = builder.idleTimeout;
     else idleTimeout = HttpClientUtil.DEFAULT_SO_TIMEOUT;
@@ -211,7 +215,10 @@ public class Http2SolrClient extends SolrClient {
       ssl = true;
     }
     // nocommit - look at config again as well
-    httpClientExecutor = new SolrQueuedThreadPool("httpClient",Integer.getInteger("solr.maxHttp2ClientThreads", Math.max(12, ParWork.PROC_COUNT / 2)), Integer.getInteger("solr.minHttp2ClientThreads", 8), idleTimeout);
+    httpClientExecutor = new SolrQueuedThreadPool("http2Client",
+        Integer.getInteger("solr.maxHttp2ClientThreads", Math.max(12, ParWork.PROC_COUNT / 2)),
+        Integer.getInteger("solr.minHttp2ClientThreads", 4),
+        this.headers.get(QoSParams.REQUEST_SOURCE).equals(QoSParams.INTERNAL) ? 500 : 5000, null, null);
     httpClientExecutor.setLowThreadsThreshold(-1);
 
     boolean sslOnJava8OrLower = ssl && !Constants.JRE_IS_MINIMUM_JAVA9;
@@ -229,6 +236,8 @@ public class Http2SolrClient extends SolrClient {
       log.debug("Create Http2SolrClient with HTTP/2 transport");
       HTTP2Client http2client = new HTTP2Client();
       http2client.setSelectors(2);
+      http2client.setIdleTimeout(idleTimeout);
+      http2client.setMaxConcurrentPushedStreams(512);
       transport = new HttpClientTransportOverHTTP2(http2client);
       httpClient = new SolrInternalHttpClient(transport, sslContextFactory);
       if (builder.maxConnectionsPerHost != null) httpClient.setMaxConnectionsPerDestination(builder.maxConnectionsPerHost);
@@ -243,10 +252,10 @@ public class Http2SolrClient extends SolrClient {
       httpClient.manage(scheduler);
       httpClient.setExecutor(httpClientExecutor);
       httpClient.manage(httpClientExecutor);
-      httpClient.setStrictEventOrdering(true);
+      httpClient.setStrictEventOrdering(strictEventOrdering);
       httpClient.setConnectBlocking(false);
       httpClient.setFollowRedirects(false);
-      httpClient.setMaxRequestsQueuedPerDestination(1024);
+      httpClient.setMaxRequestsQueuedPerDestination(10000);
       httpClient.setUserAgentField(new HttpField(HttpHeader.USER_AGENT, AGENT));
       httpClient.setIdleTimeout(idleTimeout);
       httpClient.setTCPNoDelay(true);
@@ -414,41 +423,53 @@ public class Http2SolrClient extends SolrClient {
     final ResponseParser parser = solrRequest.getResponseParser() == null
         ? this.parser: solrRequest.getResponseParser();
     asyncTracker.register();
-    req.send(new InputStreamResponseListener() {
-          @Override
-          public void onHeaders(Response response) {
-            super.onHeaders(response);
-            InputStreamResponseListener listener = this;
-            ParWork.getRootSharedExecutor().execute(() -> {
-              InputStream is = listener.getInputStream();
-              try {
-                NamedList<Object> body = processErrorsAndResponse(solrRequest, parser, response, is);
-                asyncListener.onSuccess(body);
-              } catch (RemoteSolrException e) {
-                if (SolrException.getRootCause(e) != CANCELLED_EXCEPTION) {
-                  asyncListener.onFailure(e);
-                }
-              } catch (SolrServerException e) {
-                asyncListener.onFailure(e);
-              } finally {
-                asyncTracker.arrive();
-              }
-            });
-          }
-
-          @Override
-          public void onFailure(Response response, Throwable failure) {
+    try {
+      req.send(new InputStreamResponseListener() {
+        @Override
+        public void onHeaders(Response response) {
+          super.onHeaders(response);
+          InputStreamResponseListener listener = this;
+          ParWork.getRootSharedExecutor().execute(() -> {
+            if (log.isDebugEnabled()) log.debug("async response ready");
+            InputStream is = listener.getInputStream();
             try {
-              super.onFailure(response, failure);
-              if (failure != CANCELLED_EXCEPTION) {
-                asyncListener.onFailure(new SolrServerException(failure.getMessage(), failure));
+              NamedList<Object> body = processErrorsAndResponse(solrRequest, parser, response, is);
+              asyncListener.onSuccess(body);
+            } catch (RemoteSolrException e) {
+              if (SolrException.getRootCause(e) != CANCELLED_EXCEPTION) {
+                asyncListener.onFailure(e);
               }
+            } catch (SolrServerException e) {
+              asyncListener.onFailure(e);
             } finally {
               asyncTracker.arrive();
             }
+          });
+        }
+
+        @Override
+        public void onFailure(Response response, Throwable failure) {
+          try {
+            super.onFailure(response, failure);
+            if (failure != CANCELLED_EXCEPTION) {
+              asyncListener.onFailure(new SolrServerException(failure.getMessage(), failure));
+            }
+          } finally {
+            asyncTracker.arrive();
           }
-        });
-    return () -> req.abort(CANCELLED_EXCEPTION);
+        }
+      });
+    } catch (Exception e) {
+      asyncTracker.arrive();
+      throw new SolrException(SolrException.ErrorCode.UNKNOWN, e);
+    }
+    return () -> {
+      try {
+        req.abort(CANCELLED_EXCEPTION);
+      } finally {
+        asyncTracker.arrive();
+      }
+    };
   }
 
   @Override
@@ -875,7 +896,7 @@ public class Http2SolrClient extends SolrClient {
 
   public static class AsyncTracker {
 
-    private static final int MAX_OUTSTANDING_REQUESTS = 50;
+    private static final int MAX_OUTSTANDING_REQUESTS = 500;
 
     private final Semaphore available;
 
@@ -947,12 +968,13 @@ public class Http2SolrClient extends SolrClient {
 
     private Http2SolrClient http2SolrClient;
     private SSLConfig sslConfig = defaultSSLConfig;
-    private Integer idleTimeout = Integer.getInteger("solr.http2solrclient.default.idletimeout", 30000);
+    private Integer idleTimeout = Integer.getInteger("solr.http2solrclient.default.idletimeout", 120000);
     private Integer connectionTimeout;
     private Integer maxConnectionsPerHost = 128;
     private boolean useHttp1_1 = Boolean.getBoolean("solr.http1");
     protected String baseSolrUrl;
     protected Map<String,String> headers = new ConcurrentHashMap<>();
+    protected boolean strictEventOrdering = false;
 
     public Builder() {
 
@@ -994,6 +1016,11 @@ public class Http2SolrClient extends SolrClient {
 
     public Builder useHttp1_1(boolean useHttp1_1) {
       this.useHttp1_1 = useHttp1_1;
+      return this;
+    }
+
+    public Builder strictEventOrdering(boolean strictEventOrdering) {
+      this.strictEventOrdering = strictEventOrdering;
       return this;
     }
 

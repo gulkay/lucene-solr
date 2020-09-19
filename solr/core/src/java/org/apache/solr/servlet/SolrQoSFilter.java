@@ -94,7 +94,8 @@ public class SolrQoSFilter extends QoSFilter {
         }
       }
 
-      super.doFilter(req, response, chain);
+      chain.doFilter(req, response);
+      //super.doFilter(req, response, chain);
 
     } else {
       if (log.isDebugEnabled()) log.debug("internal request, allow");

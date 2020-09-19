@@ -290,8 +290,8 @@ public class SolrTestCase extends LuceneTestCase {
 
       // unlimited - System.setProperty("solr.maxContainerThreads", "300");
       System.setProperty("solr.lowContainerThreadsThreshold", "-1");
-      System.setProperty("solr.minContainerThreads", "8");
-      System.setProperty("solr.minHttp2ClientThreads", "8");
+      System.setProperty("solr.minContainerThreads", "4");
+      System.setProperty("solr.minHttp2ClientThreads", "4");
 
 
       ScheduledTriggers.DEFAULT_COOLDOWN_PERIOD_SECONDS = 1;
